@@ -2,7 +2,10 @@
 
 pip install -r requirements.txt
 
-curl -L https://github.com/official-stockfish/Stockfish/releases/latest/download/stockfish-ubuntu-x86-64.tar -o sf.tar
-tar -xf sf.tar
-chmod +x stockfish-ubuntu-x86-64
-mv stockfish-ubuntu-x86-64 stockfish
+curl -L https://stockfishchess.org/files/stockfish_16.1_linux_x64_avx2.zip -o sf.zip
+
+unzip sf.zip
+
+chmod +x stockfish_16.1_linux_x64_avx2/stockfish
+
+mv stockfish_16.1_linux_x64_avx2/stockfish stockfish
