@@ -1,151 +1,196 @@
-# app.py
-# Flask web + persistent Stockfish engine wrapper + simple chess front-end
+#!/usr/bin/env python3
 from flask import Flask, request, jsonify, render_template_string
-import subprocess, threading, time, os, random, atexit, signal, sys
+import subprocess, threading, queue, time, os, sys, atexit, signal, random
 
 app = Flask(__name__)
 
-# Configuration via env
-STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "./stockfish")  # build.sh sẽ copy binary ra root
-THREADS = int(os.environ.get("THREADS", "2"))
-HASH = int(os.environ.get("HASH", "128"))   # MB
-DEFAULT_MOVETIME = int(os.environ.get("MOVETIME", "300"))  # ms
+DEFAULT_STOCKFISH = os.environ.get("STOCKFISH_PATH", "./stockfish")
+DEFAULT_THREADS = int(os.environ.get("THREADS", "2"))
+DEFAULT_HASH = int(os.environ.get("HASH", "128"))
+DEFAULT_MOVETIME = int(os.environ.get("MOVETIME", "300"))
 
-# --- find binary sanity check ---
 def find_stockfish():
-    candidates = [STOCKFISH_PATH, "/usr/games/stockfish", "/usr/bin/stockfish", "stockfish"]
+    candidates = [
+        os.environ.get("STOCKFISH_PATH"),
+        "./stockfish",
+        "/opt/render/project/src/stockfish",
+        "/usr/games/stockfish",
+        "/usr/bin/stockfish",
+        "/usr/local/bin/stockfish",
+        "stockfish"
+    ]
     for p in candidates:
         if not p:
             continue
         try:
-            subprocess.run([p, "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+            subprocess.run([p, "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
             return p
         except Exception:
             continue
     return None
 
-SF_BIN = find_stockfish()
-if not SF_BIN:
-    # in production you should build or install; here we fail early with clear message
-    print("ERROR: stockfish binary not found. Expected at ./stockfish or system path.", file=sys.stderr)
-    # don't exit here to allow Render build logs to show; but subsequent requests will error
-    SF_BIN = None
+SF_BIN = find_stockfish() or DEFAULT_STOCKFISH
 
-# --- Persistent Engine Class (thread-safe, restarts on crash) ---
 class PersistentEngine:
-    def __init__(self, path):
+    def __init__(self, path, threads=DEFAULT_THREADS, hash_mb=DEFAULT_HASH):
         self.path = path
-        self.lock = threading.Lock()
+        self.threads = threads
+        self.hash_mb = hash_mb
         self.proc = None
-        if path:
-            self._start()
+        self._stdout_q = queue.Queue()
+        self._reader_thread = None
+        self._lock = threading.Lock()
+        self._start_proc()
 
-    def _start(self):
+    def _start_proc(self):
         try:
-            self.proc = subprocess.Popen(
-                [self.path],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                bufsize=1
-            )
-            # init uci and apply default options
-            time.sleep(0.05)
-            self._write("uci")
-            # set sensible defaults
-            self._write(f"setoption name Threads value {THREADS}")
-            self._write(f"setoption name Hash value {HASH}")
-            # wait a small time and drain initial output
-            time.sleep(0.05)
-            for _ in range(10):
-                _ = self._readline(timeout=0.01)
+            self.proc = subprocess.Popen([self.path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
         except Exception as e:
-            print("Engine start failed:", e, file=sys.stderr)
+            print("Failed to start engine:", e, file=sys.stderr)
             self.proc = None
+            return
+        self._stdout_q = queue.Queue()
+        self._reader_thread = threading.Thread(target=self._stdout_reader, daemon=True)
+        self._reader_thread.start()
+        time.sleep(0.05)
+        try:
+            self._write("uci")
+            self._write(f"setoption name Threads value {self.threads}")
+            self._write(f"setoption name Hash value {self.hash_mb}")
+            self._write("isready")
+            self._drain_startup()
+        except Exception:
+            pass
+
+    def _stdout_reader(self):
+        if not self.proc or not self.proc.stdout:
+            return
+        try:
+            for raw in self.proc.stdout:
+                if raw is None:
+                    break
+                line = raw.rstrip("\n")
+                try:
+                    self._stdout_q.put_nowait(line)
+                except queue.Full:
+                    try:
+                        _ = self._stdout_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._stdout_q.put_nowait(line)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _write(self, cmd):
         if not self.proc or self.proc.stdin.closed:
             raise RuntimeError("Engine not running")
-        self.proc.stdin.write(cmd + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(cmd + "\n")
+            self.proc.stdin.flush()
+        except Exception as e:
+            raise RuntimeError("Engine write failed: " + str(e))
 
     def _readline(self, timeout=1.0):
-        if not self.proc:
+        try:
+            return self._stdout_q.get(timeout=timeout)
+        except queue.Empty:
             return None
-        # blocking readline with small timeouts loop
-        end = time.time() + timeout
-        while time.time() < end:
+
+    def _drain_startup(self, timeout_total=2.0):
+        start = time.time()
+        while time.time() - start < timeout_total:
+            ln = self._readline(timeout=0.1)
+            if ln is None:
+                continue
+            if ln.strip() == "readyok":
+                break
+
+    def restart(self):
+        try:
+            if self.proc:
+                try:
+                    self._write("quit")
+                except Exception:
+                    pass
+                try:
+                    self.proc.terminate()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(0.05)
+        self.proc = None
+        self._start_proc()
+
+    def is_alive(self):
+        return bool(self.proc and self.proc.poll() is None)
+
+    def set_options(self, threads=None, hash_mb=None):
+        with self._lock:
+            if threads is not None:
+                self.threads = int(threads)
+                try:
+                    self._write(f"setoption name Threads value {self.threads}")
+                except Exception:
+                    pass
+            if hash_mb is not None:
+                self.hash_mb = int(hash_mb)
+                try:
+                    self._write(f"setoption name Hash value {self.hash_mb}")
+                except Exception:
+                    pass
             try:
-                ln = self.proc.stdout.readline()
+                self._write("isready")
+                self._drain_startup(timeout_total=1.0)
             except Exception:
-                return None
-            if ln:
-                return ln.rstrip("\n")
-            time.sleep(0.01)
-        return None
+                pass
 
     def get_move(self, fen, movetime_ms=None, multipv=1):
         if movetime_ms is None:
             movetime_ms = DEFAULT_MOVETIME
-        if not self.proc:
-            # try restart
-            self._start()
-            if not self.proc:
-                return "e2e4"
-        with self.lock:
+        if not self.is_alive():
+            self.restart()
+            if not self.is_alive():
+                return {"error": "engine not available", "best_move": None}
+        with self._lock:
             try:
                 self._write(f"position fen {fen}")
-                # use movetime (ms). multipv for multiple pv if desired.
-                self._write(f"go movetime {int(movetime_ms)} multipv {multipv}")
-                cands = []
-                best = None
-                start = time.time()
-                timeout = (movetime_ms / 1000.0) + 2.0
-                while True:
-                    line = self._readline(timeout=0.5)
-                    if line is None:
-                        if time.time() - start > timeout:
-                            # restart engine if stuck
-                            try:
-                                self.proc.kill()
-                            except Exception:
-                                pass
-                            self._start()
-                            return "e2e4"
-                        continue
-                    line = line.strip()
-                    if line.startswith("info") and " pv " in line:
-                        # collect pv move
-                        try:
-                            pv = line.split(" pv ", 1)[1].split()
-                            if pv:
-                                cands.append(pv[0])
-                        except Exception:
-                            pass
-                    if line.startswith("bestmove"):
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            best = parts[1]
-                        break
-                if not best:
-                    if cands:
-                        best = cands[0]
-                    else:
-                        best = "e2e4"
-                # optional randomness among top-2 (can be disabled)
-                if len(cands) >= 2 and random.random() < 0.0:
-                    return random.choice(cands[:2])
-                return best
+                self._write(f"go movetime {int(movetime_ms)} multipv {int(multipv)}")
             except Exception as e:
-                print("Engine error:", e, file=sys.stderr)
-                try:
-                    if self.proc:
-                        self.proc.kill()
-                except Exception:
-                    pass
-                self._start()
-                return "e2e4"
+                return {"error": f"write failed: {e}", "best_move": None}
+            best_move = None
+            candidates = []
+            start = time.time()
+            timeout_total = (movetime_ms / 1000.0) + 3.0
+            while True:
+                elapsed = time.time() - start
+                if elapsed > timeout_total:
+                    break
+                ln = self._readline(timeout=0.5)
+                if ln is None:
+                    continue
+                ln_str = ln.strip()
+                if ln_str.startswith("info") and " pv " in ln_str:
+                    try:
+                        pv = ln_str.split(" pv ", 1)[1].split()
+                        if pv:
+                            candidates.append(pv[0])
+                    except Exception:
+                        pass
+                if ln_str.startswith("bestmove"):
+                    parts = ln_str.split()
+                    if len(parts) >= 2:
+                        best_move = parts[1]
+                    break
+            if not best_move:
+                if candidates:
+                    best_move = candidates[0]
+                else:
+                    best_move = None
+            return {"error": None, "best_move": best_move}
 
     def shutdown(self):
         try:
@@ -157,17 +202,13 @@ class PersistentEngine:
                 time.sleep(0.05)
                 try:
                     self.proc.terminate()
-                    self.proc.wait(timeout=1)
                 except Exception:
-                    try:
-                        self.proc.kill()
-                    except Exception:
-                        pass
+                    pass
+                self.proc = None
         except Exception:
             pass
 
-# instantiate (may be None if binary missing)
-engine = PersistentEngine(SF_BIN)
+engine = PersistentEngine(SF_BIN, threads=DEFAULT_THREADS, hash_mb=DEFAULT_HASH)
 
 def _cleanup():
     try:
@@ -179,21 +220,18 @@ atexit.register(_cleanup)
 signal.signal(signal.SIGINT, lambda s,f: (_cleanup(), sys.exit(0)))
 signal.signal(signal.SIGTERM, lambda s,f: (_cleanup(), sys.exit(0)))
 
-# ----------------- Frontend HTML (uses chessboardjs + chess.js) -----------------
-HTML = r"""
+FRONT_HTML = """
 <!doctype html>
 <html>
-<head>
-  <meta charset="utf-8">
-  <title>Stockfish on Render</title>
-  <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
-  <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
-  <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
-  <style>body{font-family:Arial;background:#223; color:#fff; text-align:center} #board{width:420px;margin:10px auto}</style>
+<head><meta charset="utf-8"><title>Stockfish Server</title>
+<link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+<script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+<style>body{font-family:Arial;background:#223;color:#fff;text-align:center}#board{width:420px;margin:10px auto}</style>
 </head>
 <body>
-<h2>Stockfish on Render</h2>
+<h2>Stockfish Server</h2>
 <div id="board"></div>
 <div style="margin-top:10px">
 <button id="playWhite">Play White</button>
@@ -234,25 +272,42 @@ $(function(){
 </html>
 """
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def index():
-    return render_template_string(HTML)
+    return render_template_string(FRONT_HTML)
+
+@app.route("/health", methods=["GET"])
+def health():
+    alive = engine.is_alive()
+    return jsonify(status="ok", engine_alive=alive, stockfish_path=SF_BIN, threads=engine.threads, hash=engine.hash_mb)
+
+@app.route("/set_options", methods=["POST"])
+def set_options():
+    data = request.get_json(force=True) or {}
+    t = data.get("threads")
+    h = data.get("hash")
+    try:
+        engine.set_options(threads=t, hash_mb=h)
+        return jsonify(status="ok", threads=engine.threads, hash=engine.hash_mb)
+    except Exception as e:
+        return jsonify(status="error", error=str(e)), 500
 
 @app.route("/move", methods=["POST"])
-def move():
+def move_route():
     data = request.get_json(force=True) or {}
     fen = data.get("fen")
-    movetime = int(data.get("movetime", DEFAULT_MOVETIME))
+    movetime = data.get("movetime", DEFAULT_MOVETIME)
     if not fen:
-        return jsonify(error="no fen provided"), 400
-    best = engine.get_move(fen, movetime_ms=movetime, multipv=1)
-    return jsonify(best_move=best)
-
-@app.route("/health")
-def health():
-    alive = bool(engine.proc and engine.proc.poll() is None)
-    return jsonify(status="ok", engine_alive=alive)
+        return jsonify(error="missing fen"), 400
+    try:
+        movetime = int(movetime)
+    except Exception:
+        movetime = DEFAULT_MOVETIME
+    res = engine.get_move(fen, movetime_ms=movetime, multipv=1)
+    if res.get("error"):
+        return jsonify(status="error", error=res["error"]), 500
+    return jsonify(status="ok", best_move=res["best_move"])
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    app.run("0.0.0.0", port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
