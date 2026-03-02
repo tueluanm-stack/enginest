@@ -205,3 +205,24 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Stockfish build / binary / temp
+stockfish
+/stockfish
+/Stockfish/
+*/Stockfish/
+*.profraw
+*.profdata
+
+# build artifacts
+/tmp/
+build/
+workspace/
+*.o
+*.a
+*.so
+
+# optional local runtime / env
+.env
+.envrc
+.vscode/
