@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
+set -e
 
+echo "📦 Install Python deps..."
 pip install -r requirements.txt
 
-curl -L https://stockfishchess.org/files/stockfish_16.1_linux_x64_avx2.zip -o sf.zip
+echo "📦 Install tools..."
+apt update -y
+apt install -y curl tar
 
-unzip sf.zip
+echo "⬇ Download Stockfish 16.1 AVX2 from GitHub release..."
+curl -L https://github.com/official-stockfish/Stockfish/releases/download/sf_16.1/stockfish-ubuntu-x86-64-avx2.tar -o sf.tar
 
-chmod +x stockfish_16.1_linux_x64_avx2/stockfish
+echo "📂 Extract..."
+tar -xf sf.tar
 
-mv stockfish_16.1_linux_x64_avx2/stockfish stockfish
+echo "🔧 Set permission..."
+chmod +x stockfish/stockfish-ubuntu-x86-64-avx2
+
+echo "📦 Move binary..."
+mv stockfish/stockfish-ubuntu-x86-64-avx2 stockfish
+
+echo "✅ Test:"
+./stockfish bench
